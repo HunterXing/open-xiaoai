@@ -60,12 +60,16 @@ docker cp xiaozhi-esp32-server:/opt/xiaozhi-esp32-server/core/connection.py \
 # 2) 生成补丁版（脚本会把两段注入插到确定的锚点上，找不到锚点会 assert 报错）
 python3 patches/make_connection_patch.py
 
-# 3) 产物即 plugins/connection_audiobook_patch.py，被 compose 挂载进容器
+# 3) 产物即 plugins/connection_intent_patch.py，被 compose 挂载进容器
 ```
 
 注入分两段：**A** 在 `response_with_functions` 之前拦一道意图预判；
-**B** 模块级补上 `_load_audiobook_titles()` 和匹配器。脚本对锚点做了
+**B** 模块级补上书名清单加载器 + 两个匹配器。脚本对锚点做了
 `assert old in text` 检查，上游改版后锚点失配会立刻报错而不是静默跳过。
+
+> 这份补丁**同时**注入「有声书 → 音乐库」两级预判，两个功能共用同一个文件
+> （音乐库那部分见 [音乐库播放](../music/README.md)）。只用有声书也不用改，
+> 音乐库相关分支在缺少凭据时会自己降级、把请求交回 LLM。
 
 ### 5. 启动与验证
 
@@ -114,3 +118,9 @@ python3 patches/probe_final_in_container.py
 | 提示语说完了但不出声 | 看桥接日志有没有「收到服务端首帧」；无 = 服务端没推，有 = 播放流没激活 |
 | 播出来是「从头再放一遍」 | 续播分支写成了「原始文件 + 裁剪版」都入队，只能二选一 |
 | 书名一直匹配不到 | 书名清单来源：先查库，查不到退回扫 `BOOKORBIT_TITLES_FALLBACK_DIR` |
+| 磁盘被占满 | 音频落点是否被写成了绝对路径（`XIAOZHI_TMP_DIR`）——base.py 只清理自己 `output_dir` 前缀下的文件，见 [compose 片段](docker-compose.additions.yml) |
+
+## 相关
+
+- 同一条链路还能播自建**音乐库**（Subsonic 兼容，如 Navidrome）→ [音乐库播放](../music/README.md)
+- 设计取舍与踩坑记录 → [有声书](../../docs/xiaoai-bookorbit-audiobook.md) / [音乐库](../../docs/xiaoai-music-library.md)

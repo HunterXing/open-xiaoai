@@ -15,3 +15,4 @@ Intent:
       - get_news_from_newsnow
       - play_music                # 服务器自带音乐播放，勿删
       - play_audiobook            # 书库有声书（原始音频文件，非 TTS）
+      - play_music_library        # 自建音乐库（Subsonic 兼容，非 TTS）
