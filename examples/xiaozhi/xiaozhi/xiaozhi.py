@@ -235,10 +235,98 @@ class XiaoZhi:
 
     def _on_incoming_audio(self, data):
         """接收音频数据回调"""
-        if self.tts_output_mode == "native_xiaomi":
+        # [本地补丁 2026-10-14] 原版在 native_xiaomi 模式下直接 return，
+        # 把服务端推来的所有二进制音频帧丢光——FILE 型音频（有声书/音乐）
+        # 走的就是这条通道，于是播放永远静默。
+        # native 模式下普通 TTS 只下文本、根本不产音频帧，所以放行二进制帧
+        # 不会影响原生 TTS 音色；保留 SPEAKING 判断即安全。
+        if self.device_state != DeviceState.SPEAKING:
+            # 被打断/播放结束时，把囤着的帧丢掉，别漏进下一次播放
+            if getattr(self, "_ab_held", None):
+                dropped = len(self._ab_held)
+                self._ab_held = []
+                print(f"🗑️ [有声书] 已离开播放态，丢弃囤下的 {dropped} 帧")
+            # 状态不对时原本静默丢弃，出问题完全看不到，打一次日志
+            if not getattr(self, "_ab_drop_logged", False):
+                self._ab_drop_logged = True
+                print(
+                    f"⚠️ [有声书] 服务端音频帧被丢弃（device_state={self.device_state}）"
+                )
             return
-        if self.device_state == DeviceState.SPEAKING:
-            self.audio_codec.write_audio(data)
+        if not getattr(self, "_ab_frame_logged", False):
+            self._ab_frame_logged = True
+            stream = getattr(self.audio_codec, "output_stream", None)
+            try:
+                active = stream.is_active() if stream is not None else None
+            except Exception:
+                active = "?"
+            # codec.write_audio 内部把所有异常都吞了，且流未激活时是静默 no-op，
+            # 所以这里必须把首帧和流状态打出来，否则失败无从判断。
+            print(
+                f"🔊 [有声书] 收到服务端首帧 {len(data)}B；"
+                f"output_stream active={active}；state={self.device_state}"
+            )
+        self._ab_write_or_hold(data)
+
+    # ---- [本地补丁 2026-10-14] 提示语念完之前先别放书声 ----
+    # 音箱上「原生音色念提示语」(miplayer) 和「服务端音频」(aplay) 是两条互不
+    # 相知的通路。服务端又是把提示语尾段与音频背靠背入队的
+    # （index_stream._process_remaining_text_stream 里先塞文本、紧接
+    # _process_before_stop_play_files 塞音频），开头叠音是结构性的。
+    # 插件侧已把提示语改成整段提前切出，正常时长下解码（十几秒）足够念完；
+    # 这里再兜一层：只要 native TTS 还有提示语没念完，PCM 先囤住，念完按序补写。
+    def _ab_say_pending(self):
+        """native TTS 是否还有提示语没念完（待切段/待合成/待播/正在播）。
+
+        _generated_files 是最可靠的信号：提示语音频生成时加入、
+        miplayer 播完才 discard，非空即代表「还有一句没念完」。
+        """
+        nt = getattr(self, "native_tts", None)
+        if nt is None:
+            return False
+        try:
+            if getattr(nt, "_pending_text", ""):
+                return True
+            if getattr(nt, "_generated_files", None):
+                return True
+            for attr in ("_segment_queue", "_audio_queue"):
+                queue = getattr(nt, attr, None)
+                if queue is not None and queue.qsize():
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _ab_emit(self, chunk):
+        """写一帧 PCM 到音箱，并记下时间戳。
+
+        KWS 侧（kws/__init__.py 补丁）靠这个时间戳判断「正在放长音频」，
+        从而在 SPEAKING 下也放开唤醒词——否则有声书播放期间打不断。
+        """
+        self.audio_codec.write_audio(chunk)
+        self._ab_last_frame_at = time.monotonic()
+
+    def _ab_write_or_hold(self, data):
+        if not self._ab_say_pending():
+            held = getattr(self, "_ab_held", None)
+            if held:
+                self._ab_held = []
+                print(f"▶️ [有声书] 提示语已念完，补写囤下的 {len(held)} 帧")
+                for chunk in held:
+                    self._ab_emit(chunk)
+            self._ab_emit(data)
+            return
+
+        held = getattr(self, "_ab_held", None)
+        if held is None:
+            held = self._ab_held = []
+            print("⏸️ [有声书] 提示语还在念，音频帧先囤住，念完再放")
+        # 兜底：万一信号没清掉（异常路径留下脏状态），囤到 ~18s 就强放，
+        # 宁可叠一下也不能整块不出声。
+        if len(held) < 300:
+            held.append(data)
+        else:
+            self._ab_emit(data)
 
     async def _on_incoming_json(self, json_data):
         """接收JSON数据回调"""

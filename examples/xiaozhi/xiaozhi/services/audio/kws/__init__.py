@@ -54,15 +54,22 @@ class _KWS:
                 AudioConfig.FRAME_SIZE, exception_on_overflow=False
             )
 
-            # 在说话和监听状态时，暂停 KWS
+            # [本地补丁 2026-10-14] 播放有声书/音乐期间也要能用唤醒词打断。
+            # 原版在 LISTENING/SPEAKING 下一律跳过 KWS，而长音频（有声书/音乐）
+            # 全程都处于 SPEAKING —— 于是「你好小爱」在播放期间完全失效，
+            # 只能靠小爱自己的 ASR（说话即触发 on_interrupt）来停。
+            # 现在只在「原生音色念回复」时保持跳过（防自触发）：
+            # 服务端在推音频帧（bridge 打的时间戳）说明是长音频在放，放行唤醒词。
+            xiaozhi = get_xiaozhi()
+            state = xiaozhi.device_state
+            streaming = (
+                time.monotonic() - getattr(xiaozhi, "_ab_last_frame_at", 0.0)
+            ) < 1.5
             if (
                 not frames
                 or self.paused
-                or get_xiaozhi().device_state
-                in [
-                    DeviceState.LISTENING,
-                    DeviceState.SPEAKING,
-                ]
+                or state == DeviceState.LISTENING
+                or (state == DeviceState.SPEAKING and not streaming)
             ):
                 time.sleep(0.01)
                 continue
