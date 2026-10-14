@@ -1,0 +1,19 @@
+# 让 xiaozhi-esp32-server 能播书库有声书，需要往你原有的 compose 里加这三处。
+# 用法：把 volumes / env_file 两段合并进你现有服务的定义，不要整份替换。
+services:
+  xiaozhi-esp32-server:
+    # 书库凭据（BOOKORBIT_PG_*）走 .env，权限 600，不要进 git
+    env_file:
+      - .env
+    volumes:
+      # ① 书库根目录，只读挂进容器。容器内路径必须与数据库里 book_files
+      #    .absolute_path 的前缀一致（都是 /books/...），否则路径校验会拒绝播放。
+      - ${BOOKORBIT_BOOKS_DIR:?set the library root path}:/books:ro
+
+      # ② 播放插件 + 意图预判模块。两者必须同目录（同一个 functions 包）才能 import。
+      - ./plugins/bookorbit_audiobook.py:/opt/xiaozhi-esp32-server/plugins_func/functions/bookorbit_audiobook.py:ro
+      - ./plugins/bookorbit_intent.py:/opt/xiaozhi-esp32-server/plugins_func/functions/bookorbit_intent.py:ro
+
+      # ③ connection.py 补丁：在调 LLM 之前做意图预判。由 patches/make_connection_patch.py
+      #    从镜像里的 connection.py 生成，生成后放到这里挂载。
+      - ./plugins/connection_audiobook_patch.py:/opt/xiaozhi-esp32-server/core/connection.py:ro

@@ -1,0 +1,17 @@
+# 追加到 data/.config.yaml —— 只加 play_audiobook 一个函数名。
+#
+# ⚠️ 必须把你镜像自带 config.yaml 里原有的那几个函数名一起写全：
+#    config_loader.merge_configs 对列表是「整体替换」而不是追加，
+#    只写一行 play_audiobook 会让 change_role / web_search / get_weather /
+#    get_news_from_newsnow / play_music 全部静默失效。
+#    以你镜像里那份 functions 列表为准，下面 6 行只是常见默认值。
+Intent:
+  function_call:
+    functions:
+      - handle_exit_intent        # 系统默认，勿删（退出意图识别）
+      - change_role
+      - web_search
+      - get_weather
+      - get_news_from_newsnow
+      - play_music                # 服务器自带音乐播放，勿删
+      - play_audiobook            # 书库有声书（原始音频文件，非 TTS）
