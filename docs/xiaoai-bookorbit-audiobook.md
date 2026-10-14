@@ -1,5 +1,9 @@
 # 小爱音箱直接播放书库有声书（BookOrbit）
 
+> 同一条链路还支持播放自建**音乐库**（Subsonic 兼容，如 Navidrome）：
+> 部署见 [`deploy/music/`](../deploy/music/README.md)，设计笔记见
+> [音乐库播放](xiaoai-music-library.md)。两者的音频通路与「意图预判」机制是共用的。
+
 ## 1. 目标
 
 让语音助手播放**书库里已有的有声书音频文件**，而不是让大模型把文字念出来：

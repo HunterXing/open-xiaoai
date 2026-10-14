@@ -1,7 +1,8 @@
 > [!NOTE]
 > **维护状态：活跃更新中。** 本 Fork 正在实际环境中持续使用和优化，
-> 当前重点维护小智 AI 接入、语音链路稳定性、小爱音箱原生音色输出，
-> 以及通过 Hermes Agent 为音箱增加记忆、联网搜索和智能家居控制。
+> 当前重点维护小智 AI 接入、语音链路稳定性、小爱音箱原生音色输出、
+> 通过 Hermes Agent 为音箱增加记忆、联网搜索和智能家居控制，
+> 以及把自建媒体库（**有声书**与**音乐**）接进音箱直接播放。
 
 # Open-XiaoAI
 
@@ -65,6 +66,37 @@
 新闻约 2.2 秒开始回应。部署方法见 [Hermes 部署说明](deploy/hermes/README.md)，
 完整测试数据见 [接入与延迟测试报告](docs/xiaoai-xiaozhi-hermes-latency-report.md)。
 
+### 播放自建媒体库：有声书与音乐
+
+音箱不再受限于固定曲库——把自建媒体库接进来，说一句就能播。播的都是库里的
+**原始音频文件**，不经过 TTS 朗读：
+
+- **有声书**（自建书库，如 BookOrbit）：说「播放三体」直接放书库里的有声书音频，
+  支持「继续播放」（接着说上次那句）和「从头播放」。
+- **音乐**（Subsonic 兼容音乐库，如 Navidrome）：说「播放音乐」随机播几首，
+  说「播放海阔天空」「播放陈奕迅的歌」按歌名/歌手点播。
+
+```text
+说「播放三体」/「播放音乐」/「播放海阔天空」
+        │
+        ▼
+connection.py（打了补丁）── 调大模型**之前**先做确定性意图预判
+        │   有声书：书名文本匹配（快）→ 未命中再问音乐库
+        │   音乐库：把候选词交给音乐库搜索「搜索即校验」，搜不到就放行
+        │   命中 → 自己造 tool_call 塞进推理流，跳过 LLM
+        ▼
+插件取库里的音频文件（ContentType.FILE）入队 → 桥接 → 音箱 aplay
+```
+
+两者共用同一条音频通路（服务端已有的 FILE 型机制，与自带 `play_music` 同分支），
+也都走**确定性意图预判**——因为「让大模型选工具」这条路在这套组合里是断的
+（后端 api_server 把请求里的 `tools` 只当请求指纹，模型看不到插件函数列表）。
+预判的判据是「宁可漏判交给模型正常回答，也不能误判成播放」，
+所以「三体讲了什么」「播放新闻」这类说法不会被拦。
+
+- 部署方法：[有声书](deploy/bookorbit/README.md) · [音乐库](deploy/music/README.md)
+- 设计取舍与实测坑：[有声书](docs/xiaoai-bookorbit-audiobook.md) · [音乐库](docs/xiaoai-music-library.md)
+
 ## 你的声音 + 小爱音箱 = 无限可能
 
 👉 [小爱音箱 + Hermes Agent，让真正的 AI 管家进入你家](https://www.bilibili.com/video/BV1hhao6cEfq)
@@ -104,6 +136,8 @@
    - 👉 [小爱音箱接入小智 AI](examples/xiaozhi/README.md)
    - 👉 [小爱原生音色与 Sherpa-ONNX TTS 切换](deploy/sherpa-tts/README.md)
    - 👉 [接入 Hermes Agent：记忆、联网搜索与智能家居](deploy/hermes/README.md)
+   - 👉 [播放自建有声书库（BookOrbit 等）](deploy/bookorbit/README.md)
+   - 👉 [播放自建音乐库（Subsonic 兼容，如 Navidrome）](deploy/music/README.md)
    - 👉 [小爱音箱自定义唤醒词](examples/kws/README.md)
    - 👉 [小爱音箱接入 MiGPT（完美版）](examples/migpt/README.md)
    - 👉 [小爱音箱接入 Gemini Live API](examples/gemini/README.md)
