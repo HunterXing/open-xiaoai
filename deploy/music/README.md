@@ -97,11 +97,23 @@ python3 test_music_intent.py
 
 # ② 容器内端到端：真搜索 / 真下载 / 真解码
 docker exec -i xiaozhi-esp32-server python3 - < probe_music_in_container.py
+
+# ③ 文字直送端到端（不吵人、可反复跑）：把一句话当用户输入喂进服务端，
+#    数回来的二进制音频帧。注意用 **真机格式**（ASR 的 JSON 外壳）才算数。
+docker cp ws_text_probe.py xiaozhi-esp32-server:/tmp/
+docker exec xiaozhi-esp32-server python3 /tmp/ws_text_probe.py \
+  '{"content": "播放音乐", "language": "zh", "emotion": "😶"}' 20
 ```
 
 `probe_music_in_container.py` 会在容器里真的 import `core.connection`、真查一次
 音乐库、真跑一遍匹配器和 tool_call 解包、真下载一首歌并用**服务端自己的解码链路**
 解出 PCM 帧数——它不复刻代码（复刻会掩盖真实的 import 缺失）。
+
+`ws_text_probe.py` 是**验证链路的最终裁判**：输出里出现
+`stt text='% play_music_library'` 说明预判命中并生成了播放指令，
+末尾的「二进制音频帧 > 0」说明服务端真的在往设备推音频。
+只用纯文本测会漏掉「ASR 外壳没解包」这类只在生产入参下才暴露的失败，
+两种格式都要跑。
 
 ## 音箱侧：提示语不与音乐重叠
 

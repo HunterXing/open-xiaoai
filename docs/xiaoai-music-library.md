@@ -123,6 +123,37 @@ if self.delete_audio_file and tts_file.startswith(self.output_file):
   表里口令是**可逆加密**存储（Subsonic token 鉴权要明文校验），不能直接写库。
   脚本见 [`nd_create_api_user.sh`](../../deploy/music/nd_create_api_user.sh)。
 
+### 8. ASR 送进来的是 JSON 外壳，不是纯文本（最容易漏的一环）
+
+真机上的入参长这样：
+
+    {"content": "播放音乐。", "language": "zh", "emotion": "😶"}
+
+（ASR 把识别文本连同语种、情绪一起返回；服务端只在带 `speaker` 字段时才拆包。）
+
+匹配器若直接拿整串去搜曲库，永远搜不到。现象是**用户说「播放音乐」，音箱答
+「我没有播放音乐的能力」**，而容器日志里预判那行「命中」压根没出现——看起来像
+「匹配器没生效」，其实是入参没解包。修法：进匹配器第一件事取出 `content`
+（非 JSON 或没有该字段就原样返回）。有声书那支同样要解，两边共用一个 `_intent_unwrap`。
+
+**校验必须用真机格式**：拿纯文本 `播放音乐` 去测会全绿，因为那根本不是生产输入。
+
+### 9. 预判分支的 if/elif 链不能拆成两个独立的 if
+
+意图预判塞在「要不要调 LLM」的分支前面，天然形成
+`if 命中: 用自造响应 / elif …: 真调 LLM`。若两个意图（有声书、音乐）各写一个
+独立 `if`，后面那个的 `elif` 会挂到**它自己**的 `if` 上——有声书命中时 `elif` 依然成立，
+真实 LLM 调用会把刚塞好的自造响应**覆盖掉**，预判白做，且现象与「没命中」一模一样。
+
+正确写法：两个意图都只往同一个 `_hit_tool_call` 里放结果，最后统一收口：
+
+    if _hit_tool_call is not None:
+        llm_responses = iter([(None, [_hit_tool_call])])
+    elif self.intent_type == "function_call" and functions is not None:
+        llm_responses = self.llm.response_with_functions(...)
+    else:
+        llm_responses = self.llm.response(...)
+
 ## 实测时序
 
 单曲 127MB / 24bit 高码率（本地音乐库）：
@@ -144,3 +175,8 @@ if self.delete_audio_file and tts_file.startswith(self.output_file):
 - **容器内端到端**（`probe_music_in_container.py`）：真 import `core.connection`、
   真查音乐库、真跑 `_merge_tool_calls` 解包、真下载一首并用服务端解码链路解出
   PCM 帧数——不复刻代码，避免掩盖真实的 import 缺失。
+- **文字直送端到端**（`ws_text_probe.py`）：以设备身份连服务端 WebSocket，用
+  `{"type":"listen","state":"detect","text":"…"}` 直接喂一句话（**text 支持与真机一致的
+  JSON 外壳**），然后数回来的**二进制音频帧**——帧数 > 0 即「服务端真的在推音频」。
+  这是唯一能在不吵到人的前提下反复回归的手段；**纯文本与带外壳两种格式都要各跑一遍**，
+  否则会漏掉「匹配器收到外壳字符串」这类只在生产入参下才出现的失败。

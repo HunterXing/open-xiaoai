@@ -31,6 +31,27 @@ _AUDIOBOOK_MATCHER = None
 _AUDIOBOOK_TITLES = None
 _AUDIOBOOK_TITLES_AT = 0.0
 _MUSIC_MATCHER = None
+
+
+def _intent_unwrap(text):
+    """把 ASR 的 JSON 外壳剥掉，取出真正的用户话语。
+
+    真机实测的入参长这样（不是纯文本）：
+        {"content": "播放音乐。", "language": "zh", "emotion": "😶"}
+    不解包的话匹配器会把整串拿去搜曲库，永远搜不到，用户听到的就是
+    「我放不了」。非 JSON 或没有 content 字段就原样返回。
+    """
+    if not isinstance(text, str):
+        return ""
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            data = json.loads(stripped)
+        except Exception:
+            return text
+        if isinstance(data, dict) and isinstance(data.get("content"), str):
+            return data["content"]
+    return text
 '''
 
 HELPERS = '''
@@ -39,6 +60,7 @@ HELPERS = '''
         """返回 (title, mode) 或 None。匹配器惰性构建、书名清单缓存 10 分钟。"""
         global _AUDIOBOOK_MATCHER, _AUDIOBOOK_TITLES, _AUDIOBOOK_TITLES_AT
         import time
+        text = _intent_unwrap(text)
         if _AUDIOBOOK_MATCHER is None or time.time() - _AUDIOBOOK_TITLES_AT > 600:
             try:
                 titles = _load_audiobook_titles()
@@ -48,19 +70,30 @@ HELPERS = '''
             except Exception as e:
                 self.logger.bind(tag=TAG).warning(f"有声书意图匹配器初始化失败: {e}")
                 return None
-        return _AUDIOBOOK_MATCHER.match(text)
+        try:
+            return _AUDIOBOOK_MATCHER.match(text)
+        except Exception as e:
+            # 匹配异常必须留痕：静默 None 的结果是用户听到「我放不了」，
+            # 而日志里一个字都没有（真机上就这么错过一次）。
+            self.logger.bind(tag=TAG).warning(f"有声书意图匹配异常，交回 LLM: {e}")
+            return None
 
     def _music_match(self, text):
         """返回 dict(kind/label/songs) 或 None。解析器惰性构建（不用缓存：
         曲库靠搜索接口现查，比冷清单准确）。命中不了就返回 None 交回 LLM。"""
         global _MUSIC_MATCHER
+        text = _intent_unwrap(text)
         if _MUSIC_MATCHER is None:
             try:
                 _MUSIC_MATCHER = MusicIntent(_load_music_resolver())
             except Exception as e:
                 self.logger.bind(tag=TAG).warning(f"音乐意图匹配器初始化失败: {e}")
                 return None
-        return _MUSIC_MATCHER.match(text)
+        try:
+            return _MUSIC_MATCHER.match(text)
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"音乐意图匹配异常，交回 LLM: {e}")
+            return None
 '''
 
 LOADER = '''
@@ -166,6 +199,7 @@ INJECT_A = '''            # BookOrbit 有声书意图预判：命中就自己造
             # response.get("choices") 取空、对 None 做 >= 而抛
             # "'>=' not supported between builtin_function_or_method and int"。
             _ab_hit = self._audiobook_match(query or "")
+            _hit_tool_call = None
             if _ab_hit is not None and functions:
                 _ab_title, _ab_mode = _ab_hit
                 self.logger.bind(tag=TAG).info(
@@ -191,7 +225,7 @@ INJECT_A = '''            # BookOrbit 有声书意图预判：命中就自己造
                         arguments=_ab_args,
                     ),
                 )
-                llm_responses = iter([(None, [_ab_tool_call])])
+                _hit_tool_call = _ab_tool_call
             # Navidrome 音乐库意图预判：接在有声书之后。
             # 与有声书不同，这里的「命中」是先问过音乐库的——搜索接口搜不到
             # 就返回 None 交回 LLM（曲库近千首，不可能像书名那样全塞进内存
@@ -233,7 +267,13 @@ INJECT_A = '''            # BookOrbit 有声书意图预判：命中就自己造
                         arguments=_mu_args,
                     ),
                 )
-                llm_responses = iter([(None, [_mu_tool_call])])
+                _hit_tool_call = _mu_tool_call
+            #
+            # 链条注意：命中判定走「单一 _hit_tool_call + 末尾 if/elif」。
+            # 别改成两个各自独立的 if——那样后面那个的 elif 会抢走 LLM 分支，
+            # 有声书命中时仍会真实调用 LLM 并覆盖预判结果（预判白做）。
+            if _hit_tool_call is not None:
+                llm_responses = iter([(None, [_hit_tool_call])])
             elif self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions('''

@@ -131,6 +131,9 @@ skip = state == DeviceState.LISTENING or (state == DeviceState.SPEAKING and not 
 | 同名书取到了电子书 | 库同一书名可能有 audio/azw3/epub/... 多条记录 | 查询限定 `library_id` |
 | 非 mp3 的文件 pydub 抛错 | 格式写死 `mp3` | 按文件扩展名传 `format=` |
 | 裁剪后文件被删导致播放中断 | 清理逻辑只保留自己 output_dir 下的文件 | 裁剪产物落到服务端 `tmp/` |
+| 说了书名却答「我放不了」，日志里连「预判命中」都没有 | **ASR 送进来的是 JSON 外壳**（`{"content": "…", "language": …, "emotion": …}`），匹配器拿整串去搜，搜不到 | 匹配器入口先解包取出 `content`（与音乐库共用 `_intent_unwrap`） |
+| 预判命中但音箱仍在「答话」 | 两个意图各写独立 `if`，后者的 `elif` 把 LLM 分支抢走并覆盖自造响应 | 收敛成单一 `_hit_tool_call`，末尾统一 `if/elif` 收口 |
+| 裁剪文件堆积、磁盘被吃 | 落点给了**绝对路径**，而 `base.py` 的清理判断是 `startswith(output_dir)`、`output_dir` 是相对的 `tmp/` | 落相对路径 `tmp/…`（可用 `XIAOZHI_TMP_DIR` 覆盖）+ 超龄兜底清扫 |
 
 **验证方法上的教训**：改完 bind mount 的文件后，「容器里 grep 到新代码」不算数——
 必须 `md5sum` 宿主与容器两侧比对。同理，测试不要复制粘贴代码片段来跑，
