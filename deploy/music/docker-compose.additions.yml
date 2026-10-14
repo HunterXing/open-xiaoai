@@ -1,0 +1,28 @@
+# 让 xiaozhi-esp32-server 能播自建音乐库（Subsonic 兼容：Navidrome / Airsonic 等）。
+# 用法：把 environment / env_file / volumes 三段合并进你现有服务的定义，不要整份替换。
+services:
+  xiaozhi-esp32-server:
+    environment:
+      # ⚠️ 音频落点必须**相对**。base.py 清理临时文件的判断是
+      #    tts_file.startswith(self.output_file)，而配置里 output_dir 就是
+      #    相对的 "tmp/"。填绝对路径会永远匹配不上 → 文件播完不删，
+      #    一首歌可能上百 MB。服务端进程的 CWD 就是项目根目录。
+      - XIAOZHI_TMP_DIR=tmp
+    env_file:
+      # 音乐库凭据（NAVIDROME_*）走 .env，权限 600，不要进 git。
+      # 缺了不影响对话——音乐分支自己降级，交回 LLM 正常回答。
+      - .env
+    volumes:
+      # 播放插件：按 id 从音乐库取音频，塞 ContentType.FILE 进 TTS 队列。
+      - ./plugins/play_music_library.py:/opt/xiaozhi-esp32-server/plugins_func/functions/play_music_library.py:ro
+      # 意图预判模块：Hermes api_server 不吃请求里的 tools（tools 只进请求
+      # 指纹做幂等），LLM 选工具这条路是断的，所以改在 connection.py 里
+      # 用确定性匹配直接造 tool_call。插件和它必须同目录才能 import。
+      - ./plugins/music_intent.py:/opt/xiaozhi-esp32-server/plugins_func/functions/music_intent.py:ro
+      # connection.py 补丁：**与有声书共用同一份**，由
+      # deploy/bookorbit/patches/make_connection_patch.py 生成，
+      # 命中顺序是 有声书 → 音乐库 → LLM。只用音乐功能也要挂这一份。
+      - ./plugins/connection_intent_patch.py:/opt/xiaozhi-esp32-server/core/connection.py:ro
+
+      # 注意：音乐库**不需要**挂目录。曲目是按 id 经 HTTP 取回的原始文件，
+      # 容器看不到音乐库的文件系统也能播。

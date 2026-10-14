@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成 core/connection.py 的有声书意图预判补丁。
+"""生成 core/connection.py 的意图预判补丁（有声书 + 音乐库）。
 
 从容器内原文件读起，注入两处代码后整文件写回宿主。
 用 python 整块替换而不是多次小 patch——1852 行的大文件局部叠加
@@ -7,14 +7,17 @@
 
 两处注入：
   A) llm_responses 之前：命中意图就自己造 tool_call，跳过 LLM
-  B) 文件末尾：意图匹配器（惰性加载，书名清单缓存 10 分钟）
+  B) 文件末尾：意图匹配器（惰性加载；书名清单缓存 10 分钟，曲库现查）
+
+命中顺序：有声书 → 音乐库 → LLM。有声书是纯文本匹配（快、零请求），
+音乐库要问一次搜索接口，所以放后面，命中不了再交回 LLM。
 """
 
 import re
 import sys
 
 SRC = "patches/connection.py.orig"
-DST = "plugins/connection_audiobook_patch.py"
+DST = "plugins/connection_intent_patch.py"
 
 PRELUDE = '''
 # ---- BookOrbit 有声书意图预判（补丁起点）--------------------------------
@@ -27,6 +30,7 @@ PRELUDE = '''
 _AUDIOBOOK_MATCHER = None
 _AUDIOBOOK_TITLES = None
 _AUDIOBOOK_TITLES_AT = 0.0
+_MUSIC_MATCHER = None
 '''
 
 HELPERS = '''
@@ -45,12 +49,24 @@ HELPERS = '''
                 self.logger.bind(tag=TAG).warning(f"有声书意图匹配器初始化失败: {e}")
                 return None
         return _AUDIOBOOK_MATCHER.match(text)
+
+    def _music_match(self, text):
+        """返回 dict(kind/label/songs) 或 None。解析器惰性构建（不用缓存：
+        曲库靠搜索接口现查，比冷清单准确）。命中不了就返回 None 交回 LLM。"""
+        global _MUSIC_MATCHER
+        if _MUSIC_MATCHER is None:
+            try:
+                _MUSIC_MATCHER = MusicIntent(_load_music_resolver())
+            except Exception as e:
+                self.logger.bind(tag=TAG).warning(f"音乐意图匹配器初始化失败: {e}")
+                return None
+        return _MUSIC_MATCHER.match(text)
 '''
 
 LOADER = '''
 
 def _load_audiobook_titles():
-    """从 BookOrbit 库取有声书书名。取不到就退回目录扫描。"""
+    """从 BookOrbit 库取有声书书名（library_id=4）。取不到就退回目录扫描。"""
     import os
     try:
         import psycopg2
@@ -84,6 +100,54 @@ def _load_audiobook_titles():
         )
     except Exception:
         return []
+
+
+def _load_music_resolver():
+    """音乐库解析器：Subsonic 搜索 + 随机取曲。
+
+    不做缓存——曲库靠搜索接口现查，比拿一份冷清单准；
+    单次查询十几毫秒，比误判便宜得多（缓存清单反而会因重排而变旧）。
+    """
+    import hashlib
+    import json as _json
+    import os
+    import secrets
+    import urllib.parse
+    import urllib.request
+
+    class _NavidromeResolver:
+        def __init__(self):
+            self.base = os.environ["NAVIDROME_URL"].rstrip("/")
+
+        def _call(self, endpoint, **params):
+            # Subsonic token 鉴权：口令不进 URL，也不落日志
+            salt = secrets.token_hex(8)
+            token = hashlib.md5(
+                (os.environ["NAVIDROME_PASSWORD"] + salt).encode("utf-8")
+            ).hexdigest()
+            query = {
+                "u": os.environ["NAVIDROME_USER"],
+                "t": token,
+                "s": salt,
+                "v": "1.16.1",
+                "c": "xiaozhi",
+                "f": "json",
+                **params,
+            }
+            url = f"{self.base}/rest/{endpoint}?" + urllib.parse.urlencode(query)
+            # 超时压短：这是对话请求路径上的一步，不能把回复卡住
+            with urllib.request.urlopen(url, timeout=4) as resp:
+                return _json.loads(resp.read().decode("utf-8"))["subsonic-response"]
+
+        def search(self, query, limit=20):
+            body = self._call("search3.view", query=query, songCount=limit)
+            return ((body.get("searchResult3") or {}).get("song")) or []
+
+        def random_songs(self, limit=3):
+            body = self._call("getRandomSongs.view", size=limit)
+            return ((body.get("randomSongs") or {}).get("song")) or []
+
+    return _NavidromeResolver()
 '''
 
 # ---- 注入 A：LLM 之前命中则直接造 tool_call ----
@@ -128,6 +192,48 @@ INJECT_A = '''            # BookOrbit 有声书意图预判：命中就自己造
                     ),
                 )
                 llm_responses = iter([(None, [_ab_tool_call])])
+            # Navidrome 音乐库意图预判：接在有声书之后。
+            # 与有声书不同，这里的「命中」是先问过音乐库的——搜索接口搜不到
+            # 就返回 None 交回 LLM（曲库近千首，不可能像书名那样全塞进内存
+            # 做文本匹配；搜索即校验，代价是十几毫秒的本地请求）。
+            # 有声书优先：两边都可能命中时（比如书名撞上歌名）以有声书为准。
+            _mu_hit = (
+                self._music_match(query or "")
+                if _ab_hit is None and functions
+                else None
+            )
+            if _mu_hit is not None:
+                _mu_songs = _mu_hit.get("songs") or []
+                self.logger.bind(tag=TAG).info(
+                    f"音乐库意图预判命中：{_mu_hit.get('label')}"
+                    f"（{len(_mu_songs)} 首，跳过 LLM）"
+                )
+                _mu_args = json.dumps(
+                    {
+                        "kind": _mu_hit.get("kind", "song"),
+                        "label": _mu_hit.get("label", ""),
+                        "songs": [
+                            {
+                                "id": s.get("id"),
+                                "title": s.get("title"),
+                                "artist": s.get("artist"),
+                                "duration": s.get("duration"),
+                            }
+                            for s in _mu_songs
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                _mu_tool_call = SimpleNamespace(
+                    index=0,
+                    id="call_music_library",
+                    type="function",
+                    function=SimpleNamespace(
+                        name="play_music_library",
+                        arguments=_mu_args,
+                    ),
+                )
+                llm_responses = iter([(None, [_mu_tool_call])])
             elif self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions('''
@@ -140,7 +246,7 @@ def main():
     with open(SRC, encoding="utf-8") as f:
         text = f.read()
 
-    # 导入 bookorbit_intent
+    # 导入两个意图匹配器（分开 try：一个缺了不影响另一个）
     import_anchor = "TAG = __name__"
     assert text.count(import_anchor) >= 1, "TAG anchor not found"
     text = text.replace(
@@ -149,7 +255,11 @@ def main():
         "try:\n"
         "    from plugins_func.functions.bookorbit_intent import AudiobookIntent\n"
         "except Exception:  # 预判不可用时降级为纯 LLM 对话，不影响其它功能\n"
-        "    AudiobookIntent = None",
+        "    AudiobookIntent = None\n"
+        "try:\n"
+        "    from plugins_func.functions.music_intent import MusicIntent\n"
+        "except Exception:\n"
+        "    MusicIntent = None",
         1,
     )
 
