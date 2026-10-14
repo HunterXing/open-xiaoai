@@ -195,9 +195,17 @@ class LLMProvider(LLMProviderBase):
             )
         )
 
-    def _events(self, dialogue):
-        """Yield ("tool", name) and ("text", chunk) from Hermes' SSE stream."""
+    def _events(self, dialogue, functions=None):
+        """Yield ("tool", name), ("text", chunk) and ("toolcall", args) from Hermes' SSE stream.
+
+        xiaozhi hands us its own plugin function list (play_music, play_audiobook, …).
+        Hermes is the one running the conversation, so those functions have to travel
+        to it as OpenAI-style `tools`; otherwise the model has no way to reach them.
+        """
         body = {"model": self.model_name, "messages": dialogue, "stream": True}
+        if functions:
+            body["tools"] = functions
+            body["tool_choice"] = "auto"
         if self.temperature not in (None, ""):
             body["temperature"] = float(self.temperature)
         if self.max_tokens not in (None, ""):
@@ -230,9 +238,30 @@ class LLMProvider(LLMProviderBase):
                     yield "tool", data.get("tool", "")
                 elif event in (None, "message"):
                     for choice in data.get("choices") or []:
-                        content = (choice.get("delta") or {}).get("content")
+                        delta = choice.get("delta") or {}
+                        content = delta.get("content")
                         if content:
                             yield "text", content
+                        # Hermes may answer with a call to one of xiaozhi's own
+                        # plugins. Relay it in the OpenAI tool_calls shape that
+                        # connection.py::_merge_tool_calls already understands.
+                        # A streamed call arrives in fragments: only the first
+                        # carries the name and id, later ones carry arguments
+                        # only, so a fragment must be relayed even with no name.
+                        for call in delta.get("tool_calls") or []:
+                            if not isinstance(call, dict):
+                                continue
+                            fn = call.get("function") or {}
+                            if fn.get("name") or fn.get("arguments"):
+                                yield "toolcall", {
+                                    "index": call.get("index", 0),
+                                    "id": call.get("id") or "",
+                                    "type": "function",
+                                    "function": {
+                                        "name": fn.get("name"),
+                                        "arguments": fn.get("arguments") or "",
+                                    },
+                                }
 
     @staticmethod
     def _clean(chunks):
@@ -245,10 +274,14 @@ class LLMProvider(LLMProviderBase):
                 started = True
             yield chunk
 
-    def _texts(self, dialogue):
-        return (value for kind, value in self._events(dialogue) if kind == "text")
+    def _texts(self, dialogue, functions=None):
+        return (
+            value
+            for kind, value in self._events(dialogue, functions)
+            if kind == "text"
+        )
 
-    def _with_search_filler(self, events, state):
+    def _with_search_filler(self, dialogue, state, functions=None):
         """Text of one Hermes turn, speaking our own filler when a search starts.
 
         state["spoken"] tells whether anything was yielded; state["held"] keeps
@@ -256,7 +289,9 @@ class LLMProvider(LLMProviderBase):
         """
         held = ""
         deciding = True
-        for kind, value in events:
+        for kind, value in self._events(dialogue, functions):
+            if kind == "toolcall":
+                continue  # a plugin call is not something the speaker reads out
             if kind == "tool":
                 if deciding:
                     # The model's own "我查一下…" before the tool is dropped.
@@ -302,20 +337,8 @@ class LLMProvider(LLMProviderBase):
             held = ""
         state["held"] = held
 
-    def response(self, session_id, dialogue, **kwargs):
-        dialogue = [dict(message) for message in dialogue]
-        for message in dialogue:
-            message.setdefault("content", "")
-        if self.slim_system_prompt:
-            slimmed = []
-            for message in dialogue:
-                if message.get("role") == "system":
-                    content = slim_system_prompt(message["content"])
-                    if content is None:
-                        continue
-                    message["content"] = content
-                slimmed.append(message)
-            dialogue = slimmed
+    def response(self, session_id, dialogue, functions=None, **kwargs):
+        dialogue = self._prepare(dialogue)
         users = [m for m in dialogue if m.get("role") == "user"]
         request = _message_text(users[-1]) if users else ""
 
@@ -325,7 +348,7 @@ class LLMProvider(LLMProviderBase):
             required, note, reason = "ha_", STATE_RETRY_NOTE, "设备状态问题未查询"
         else:
             state = {"spoken": False, "held": ""}
-            yield from self._clean(self._with_search_filler(self._events(dialogue), state))
+            yield from self._clean(self._with_search_filler(dialogue, state, functions))
             if state["spoken"]:
                 return
             logger.bind(tag=TAG).warning(
@@ -333,7 +356,9 @@ class LLMProvider(LLMProviderBase):
             )
             retry_state = {"spoken": False, "held": ""}
             retry = self._with_note(dialogue, request, FILLER_RETRY_NOTE)
-            yield from self._clean(self._with_search_filler(self._events(retry), retry_state))
+            yield from self._clean(
+                self._with_search_filler(retry, retry_state, functions)
+            )
             if not retry_state["spoken"] and self.search_failed_reply:
                 yield self.search_failed_reply
             return
@@ -343,7 +368,9 @@ class LLMProvider(LLMProviderBase):
         state = {"used_tool": False, "held": []}
 
         def guarded():
-            for kind, value in self._events(dialogue):
+            for kind, value in self._events(dialogue, functions):
+                if kind == "toolcall":
+                    continue  # a plugin call satisfies the guard on its own
                 if kind == "tool":
                     if not state["used_tool"] and (required is None or value.startswith(required)):
                         state["used_tool"] = True
@@ -361,8 +388,78 @@ class LLMProvider(LLMProviderBase):
 
         held = state["held"]
         logger.bind(tag=TAG).warning(f"{reason}，已丢弃回答并重试: {request} -> {''.join(held)[:60]}")
-        retry = self._events(self._with_note(dialogue, request, note))
-        yield from self._clean(self._with_search_filler(retry, {"spoken": False, "held": ""}))
+        retry = self._with_note(dialogue, request, note)
+        yield from self._clean(
+            self._with_search_filler(retry, {"spoken": False, "held": ""}, functions)
+        )
+
+    def _prepare(self, dialogue):
+        """Copy the dialogue and keep only xiaozhi's real-time facts in the system prompt."""
+        dialogue = [dict(message) for message in dialogue]
+        for message in dialogue:
+            message.setdefault("content", "")
+        if not self.slim_system_prompt:
+            return dialogue
+        slimmed = []
+        for message in dialogue:
+            if message.get("role") == "system":
+                content = slim_system_prompt(message["content"])
+                if content is None:
+                    continue
+                message["content"] = content
+            slimmed.append(message)
+        return slimmed
+
+    def response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
+        """Yield (text, tool_calls) the way connection.py expects.
+
+        connection.py merges the tool_calls through _merge_tool_calls, so the
+        plugin that Hermes called really runs on the device side.
+        """
+        if not functions:
+            for token in self.response(session_id, dialogue, **kwargs):
+                yield token, None
+            return
+
+        dialogue = self._prepare(dialogue)
+        pending = {}
+        said = False
+        for kind, value in self._events(dialogue, functions):
+            if kind == "text":
+                if value.strip():
+                    said = True
+                yield value, None
+            elif kind == "toolcall":
+                idx = value.get("index") or 0
+                slot = pending.get(idx)
+                if slot is None:
+                    pending[idx] = {
+                        "index": idx,
+                        "id": value.get("id") or "call_hermes_0",
+                        "type": "function",
+                        "function": {
+                            "name": value["function"]["name"],
+                            "arguments": value["function"]["arguments"],
+                        },
+                    }
+                    continue
+                # Later fragments carry arguments only; never blank the name.
+                if value["function"]["name"]:
+                    slot["function"]["name"] = value["function"]["name"]
+                slot["function"]["arguments"] += value["function"]["arguments"]
+        for idx in sorted(pending):
+            call = pending[idx]
+            if not call["function"]["name"]:
+                logger.bind(tag=TAG).warning(
+                    f"工具调用缺少函数名，已丢弃: index={idx}"
+                )
+                continue
+            yield None, [call]
+        if pending or said:
+            return
+        # Hermes said nothing and called nothing: let the normal retry logic speak.
+        for token in self.response(session_id, dialogue, functions=functions, **kwargs):
+            yield token, None
 
     @staticmethod
     def _with_note(dialogue, request, note):
@@ -370,7 +467,3 @@ class LLMProvider(LLMProviderBase):
         last_user = max(i for i, message in enumerate(retry) if message.get("role") == "user")
         retry[last_user]["content"] = f"{request}\n{note}"
         return retry
-
-    def response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
-        for token in self.response(session_id, dialogue, **kwargs):
-            yield token, None
