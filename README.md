@@ -97,6 +97,79 @@ connection.py（打了补丁）── 调大模型**之前**先做确定性意�
 - 部署方法：[有声书](deploy/bookorbit/README.md) · [音乐库](deploy/music/README.md)
 - 设计取舍与实测坑：[有声书](docs/xiaoai-bookorbit-audiobook.md) · [音乐库](docs/xiaoai-music-library.md)
 
+#### 完整链路：从 NAS 到音箱
+
+说一句「播放海阔天空」之后，数据在你家里走过的完整路径：
+
+```mermaid
+flowchart TD
+    SAY(["🗣 「你好小爱，播放海阔天空」"]) --> KWS
+
+    subgraph DEV["🎙 小爱音箱 Pro"]
+        KWS["本地唤醒词 KWS"]
+        MIC["拾音 · 上行音频流"]
+        APLAY["aplay 播放下行音频"]
+        NATIVE["mibrain 原生音色读提示语"]
+    end
+
+    subgraph BRG["🌉 桥接 open-xiaoai-xiaozhi"]
+        FWD["音频帧双向转发"]
+        GATE["放行 FILE 型音频帧<br/>（native 模式默认会丢）"]
+        HOLD["等提示语念完再放行"]
+    end
+
+    subgraph SRV["🧠 小智服务端 xiaozhi-esp32-server"]
+        ASR["ASR 识别<br/>文本 + 语言 + 情绪"]
+        PRED{"确定性意图预判<br/>（在调大模型之前）"}
+        PLAB["play_audiobook"]
+        PLMU["play_music_library"]
+        LLM["Hermes Agent<br/>记忆 / Skills / 联网 / 家居控制"]
+        FQ["FILE 型音频入队"]
+        DEC["ffmpeg 解码<br/>16kHz 单声道 PCM"]
+        PUSH["opus 编码 60ms 一帧<br/>实时推流"]
+    end
+
+    subgraph MED["📚 媒体服务（本机容器）"]
+        ND["Navidrome · Subsonic API"]
+        BO["BookOrbit · 书库与播放进度"]
+    end
+
+    subgraph NAS["🗄 NAS 存储"]
+        MUS["音乐库 flac / mp3"]
+        BOOK["有声书库 mp3 按集"]
+    end
+
+    KWS --> MIC --> FWD --> ASR --> PRED
+    PRED -->|"书名匹配命中"| PLAB
+    PRED -->|"音乐搜索命中"| PLMU
+    PRED -->|"都没命中 → 交回模型"| LLM
+    PLAB -->|"读进度 + 取原文件（续播先裁剪）"| BO --> BOOK
+    PLMU -->|"search3 搜索即校验"| ND
+    ND -->|"stream?id 取原始文件"| MUS
+    BOOK --> FQ
+    MUS --> FQ
+    FQ --> DEC --> PUSH --> FWD
+    FWD --> GATE --> HOLD --> APLAY
+    LLM --> NATIVE
+    KWS -.->|"播放中喊唤醒词 = 打断"| HOLD
+```
+
+各段的分工：
+
+| 段 | 位置 | 干什么 |
+| --- | --- | --- |
+| 唤醒与拾音 | 音箱本地 | 唤醒词不上云；说话音频上行 |
+| 转发与闸门 | 桥接容器 | 双向转发音频帧；放行服务端下发的音频流（原版在原生音色模式下会丢弃） |
+| 识别与预判 | 小智服务端 | ASR 出文本后**先**做确定性意图预判：命中就直接造播放指令，不惊动大模型 |
+| 播放执行 | 小智服务端 | 插件向媒体服务取原始文件（`ContentType.FILE`），ffmpeg 解码成 PCM，再编成 opus 帧推给音箱 |
+| 媒体服务 | 本机容器 | Navidrome 提供搜索与取流；BookOrbit 提供书库索引与播放进度 |
+| 存储 | NAS | 音频文件本体；容器通过挂载读取，**不需要把音频搬来搬去** |
+
+两个关键设计点：
+
+- **原始文件直达**：播的是库里的 flac / mp3 本体，不经过 TTS 合成，音质与文件一致（实测 127MB 高码率单曲取回约 0.4 秒）。
+- **预判宁可漏判**：命中不了就交回大模型正常回答，所以「播放新闻」「三体讲了什么」这类说法不会被误拦成播放。
+
 ## 你的声音 + 小爱音箱 = 无限可能
 
 👉 [小爱音箱 + Hermes Agent，让真正的 AI 管家进入你家](https://www.bilibili.com/video/BV1hhao6cEfq)
