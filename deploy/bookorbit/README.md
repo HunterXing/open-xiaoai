@@ -39,6 +39,11 @@ api_server 用自己的 toolsets，请求体里的 `tools` 只进请求指纹做
 书库根目录要**只读**挂载，并且**容器内路径必须与数据库里 `book_files.absolute_path`
 的前缀一致**（都是 `/books/...`）——插件会做路径越界校验，不一致会直接拒绝播放。
 
+> **首响提速（文件流式播放优化）**：`deploy/xiaozhi/plugins/fast_audio_stream.py`
+> 把「整段解码完才推流」换成 ffmpeg 边解边推，19 分钟的集子首帧从实测 ~10s
+> 降到 ~0.3s；同时绕开「文件帧攒到播报结束才灌队列」的收集器回调。
+> 挂载行见 additions ②′。**与音乐库功能共用同一份**，两个功能只挂一次。
+
 ### 2. 函数白名单
 
 按 [`config-snippet.yaml`](config-snippet.yaml) 往 `data/.config.yaml` 的

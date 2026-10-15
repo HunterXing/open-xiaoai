@@ -62,6 +62,11 @@ Hermes 的 api_server 建 agent 时用自己的 toolsets，请求体里的 `tool
 ⚠️ 音乐库**不需要**给容器挂目录：曲目是按 id 经 HTTP 取回的原始文件，
 容器看不到音乐库的文件系统也没关系。
 
+> **首响提速**：`deploy/xiaozhi/plugins/fast_audio_stream.py` 让 FILE 音频
+> 边解边推（首帧 ~0.3s）并直推播放队列；音乐插件侧另把同步下载挪进线程池
+> （不阻塞事件循环，否则播报消息要排队等下载完才发出）。挂载行见 additions。
+> **与有声书功能共用同一份**，两个功能只挂一次。
+
 ### 3. 函数白名单
 
 按 [`../bookorbit/config-snippet.yaml`](../bookorbit/config-snippet.yaml) 往

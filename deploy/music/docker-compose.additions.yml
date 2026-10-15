@@ -24,5 +24,11 @@ services:
       # 命中顺序是 有声书 → 音乐库 → LLM。只用音乐功能也要挂这一份。
       - ./plugins/connection_intent_patch.py:/opt/xiaozhi-esp32-server/core/connection.py:ro
 
+      # 文件流式播放优化：FILE 音频边解边推（首帧 ~0.3s），并让文件帧直推
+      # 播放队列，不再「攒到播报结束才灌」。**与有声书功能共用同一份**
+      # （deploy/xiaozhi/plugins/fast_audio_stream.py），两个功能都接也只挂
+      # 这一份；被 play_music_library 插件 import，缺了自动退回服务端原实现。
+      - ./plugins/fast_audio_stream.py:/opt/xiaozhi-esp32-server/plugins_func/functions/fast_audio_stream.py:ro
+
       # 注意：音乐库**不需要**挂目录。曲目是按 id 经 HTTP 取回的原始文件，
       # 容器看不到音乐库的文件系统也能播。

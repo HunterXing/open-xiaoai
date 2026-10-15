@@ -20,6 +20,14 @@ services:
       #    两个功能都接的话只挂这一份即可。
       - ./plugins/connection_intent_patch.py:/opt/xiaozhi-esp32-server/core/connection.py:ro
 
+      # ②′ 文件流式播放优化：FILE 音频边解边推（首帧 ~0.3s；服务端原实现
+      #     整段解码完才推，19 分钟集子约 10s）。还顺带绕开「文件先攒完、
+      #     等播报结束再灌」的收集器回调，音频产出即进播放队列。
+      #     **与音乐库功能共用同一份**：实际文件在 deploy/xiaozhi/plugins/
+      #     fast_audio_stream.py，两个功能都接也只挂这一份。
+      #     被上面两个播放插件 import；缺了不影响播放（自动退回原实现）。
+      - ./plugins/fast_audio_stream.py:/opt/xiaozhi-esp32-server/plugins_func/functions/fast_audio_stream.py:ro
+
       # ④ 音频落点（TTS 裁剪/下载的临时文件）。**必须相对路径**：
       #    base.py 清理临时文件的判断是 tts_file.startswith(output_dir)，
       #    而配置里 output_dir 就是相对的 "tmp/"。填绝对路径会导致文件播完不删。

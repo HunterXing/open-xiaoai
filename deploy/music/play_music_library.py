@@ -13,6 +13,7 @@ function call 这条路是断的（详见 music_intent.py 的说明）。入口�
 里注入的确定性预判，它把解析好的曲目直接塞进 tool_call 参数。
 """
 
+import asyncio
 import os
 import time
 import urllib.parse
@@ -21,6 +22,13 @@ import urllib.request
 from core.providers.tts.dto.dto import TTSMessageDTO, SentenceType, ContentType
 from plugins_func.register import register_function, ToolType, ActionResponse, Action
 from typing import TYPE_CHECKING
+
+# 流式转码（import 即生效）：FILE 音频不再「整段解码完才推」，首帧 ~0.3s。
+# 导入失败不影响播放——服务端会走原实现，详见 fast_audio_stream.py。
+try:
+    import fast_audio_stream  # noqa: F401
+except Exception:  # pragma: no cover
+    pass
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
@@ -98,7 +106,10 @@ async def play_music_library(conn: "ConnectionHandler", songs=None, kind="song",
     played = 0
     for song in songs:
         try:
-            path = _fetch(conn, song["id"])
+            # _fetch 是同步 urllib 下载：必须丢线程池执行。
+            # 直接在事件循环上跑会锁死整个 loop（实测 5 首约 4.4s：
+            # 连「播报」的发送都被排在循环后面，首响被拖成几秒）。
+            path = await asyncio.to_thread(_fetch, conn, song["id"])
         except Exception as e:
             conn.logger.bind(tag=TAG).warning(
                 f"音乐下载失败，跳过 {song.get('title')!r}: {e}")

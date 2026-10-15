@@ -7,6 +7,7 @@
 """
 import asyncio
 import json
+import time
 import sys
 import uuid
 
@@ -45,6 +46,9 @@ async def main(text, listen_seconds):
             "text": text,
         }))
         print(f">> TEXT: {text!r}")
+        t_sent = time.time()
+        t_first_text = None
+        t_first_frame = None
 
         audio_frames = 0
         audio_bytes = 0
@@ -58,6 +62,9 @@ async def main(text, listen_seconds):
             except asyncio.TimeoutError:
                 break
             if isinstance(msg, bytes):
+                if t_first_frame is None:
+                    t_first_frame = time.time() - t_sent
+                    print(f"<< ⏱ 首帧音频: +{t_first_frame:.2f}s")
                 audio_frames += 1
                 audio_bytes += len(msg)
                 continue
@@ -68,6 +75,8 @@ async def main(text, listen_seconds):
                 continue
             t = obj.get("type")
             if t == "tts":
+                if t_first_text is None and obj.get('text'):
+                    t_first_text = time.time() - t_sent
                 print(f"<< tts state={obj.get('state')} text={(obj.get('text') or '')[:80]!r}")
             elif t == "stt":
                 print(f"<< stt text={(obj.get('text') or '')[:80]!r}")
@@ -80,6 +89,8 @@ async def main(text, listen_seconds):
                 print(f"<< {t}: {json.dumps(obj, ensure_ascii=False)[:160]}")
 
         print(f"\n=== 结果：二进制音频帧 {audio_frames} 个 / {audio_bytes} 字节 ===")
+        if t_first_text is not None and t_first_frame is not None:
+            print(f"=== ⏱ 延迟分解：播报文本 +{t_first_text:.2f}s → 首帧音频 +{t_first_frame:.2f}s（静默等待 {t_first_frame - t_first_text:.2f}s）===")
         print("=== 判定：", "✅ 服务端真的在推音频" if audio_frames else "❌ 没有音频推出", "===")
 
 

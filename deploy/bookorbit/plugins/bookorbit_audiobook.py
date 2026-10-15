@@ -9,10 +9,19 @@
 """
 
 import os
+import asyncio
+import subprocess
 
 from core.providers.tts.dto.dto import TTSMessageDTO, SentenceType, ContentType
 from plugins_func.register import register_function, ToolType, ActionResponse, Action
 from typing import TYPE_CHECKING
+
+# 流式转码（import 即生效）：FILE 音频不再「整段解码完才推」，首帧 ~0.3s。
+# 导入失败不影响播放——服务端会走原实现，详见 fast_audio_stream.py。
+try:
+    import fast_audio_stream  # noqa: F401
+except Exception:  # pragma: no cover
+    pass
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
@@ -83,12 +92,15 @@ async def play_audiobook(conn: "ConnectionHandler", title: str, mode: str = "res
         f"有声书命中: 《{book_title}》{file_title} 起播={start_seconds}s path={abs_path}"
     )
 
-    _say(conn, _announce_text(book_title, file_title))
+    # 提示语。默认开；排查首响延迟时可设 BOOKORBIT_ANNOUNCE=0 静默起播。
+    if os.environ.get("BOOKORBIT_ANNOUNCE", "1") != "0":
+        _say(conn, _announce_text(book_title, file_title))
 
     # 起播位置 >0 时只放裁剪版：AudioRateController 逐帧控速，不裁会从集头重放；
     # 若原始文件也入队，整集先放一遍、紧接着又从头续播同样的内容。
     if start_seconds > 0:
-        _enqueue_trimmed(conn, abs_path, start_seconds)
+        # ffmpeg 流拷贝（0.2-0.5s 同步子进程）：丢线程池，别卡事件循环
+        await asyncio.to_thread(_enqueue_trimmed, conn, abs_path, start_seconds)
     else:
         _enqueue_file(conn, abs_path)
 
@@ -143,7 +155,57 @@ def _enqueue_file(conn, abs_path):
 
 
 def _enqueue_trimmed(conn, abs_path, start_seconds):
-    """裁掉已听过的部分后入队，落 tmp/（base.py 只删自己 output_dir 下的文件）。"""
+    """裁掉已听过的部分后入队，落 tmp/（base.py 只删自己 output_dir 下的文件）。
+
+    用 ffmpeg `-c copy` 流拷贝切段（不重编码），19 分钟的集子 0.2-0.5s 出结果；
+    切点按容器帧对齐（mp3 ≤26ms），对进度回写够用。
+    原实现走 pydub（AudioSegment.from_file + export）＝整段解码 + 重编码，
+    实测 8 秒，用户侧就是「说完半天没动静」——保留为失败兜底。
+    """
+    fmt = abs_path.rsplit(".", 1)[-1].lower() if "." in abs_path else "mp3"
+    out_dir = os.environ.get("XIAOZHI_TMP_DIR", "tmp")
+    os.makedirs(out_dir, exist_ok=True)
+    # 输出容器跟随源格式（库里不只有 mp3，实测《诡秘之主》是 .m4a；
+    # aac 流拷进 mp3 容器会直接报错）。相对路径的原因见 pydub 版注释。
+    out_path = os.path.join(out_dir, f"resume-{int(start_seconds)}-{os.getpid()}.{fmt}")
+
+    ok = False
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-ss", str(start_seconds), "-i", abs_path,
+                "-vn", "-c:a", "copy", "-y", out_path,
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        ok = (
+            proc.returncode == 0
+            and os.path.exists(out_path)
+            and os.path.getsize(out_path) > 0
+        )
+        if not ok:
+            conn.logger.bind(tag=TAG).warning(
+                f"ffmpeg 流拷贝失败 rc={proc.returncode}: "
+                f"{proc.stderr.decode('utf-8', 'ignore')[:200]}"
+            )
+    except Exception as e:
+        conn.logger.bind(tag=TAG).warning(f"ffmpeg 流拷贝异常: {e}")
+
+    if not ok:
+        conn.logger.bind(tag=TAG).info("退回 pydub 裁剪（慢但稳）")
+        _enqueue_trimmed_pydub(conn, abs_path, start_seconds)
+        return
+
+    conn.logger.bind(tag=TAG).info(
+        f"已裁掉前 {start_seconds}s（ffmpeg 流拷贝）→ {out_path}"
+    )
+    _enqueue_file(conn, out_path)
+
+
+def _enqueue_trimmed_pydub(conn, abs_path, start_seconds):
+    """慢速兜底：pydub 解码 + 重编码（全量，19 分钟集子约 8s）。"""
     from pydub import AudioSegment
 
     # 库里不只有 mp3（实测《诡秘之主》是 .m4a），格式必须跟扩展名走，
