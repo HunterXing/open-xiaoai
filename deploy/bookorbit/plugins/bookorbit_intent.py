@@ -102,6 +102,42 @@ _IGNORED_CHARS = re.compile(r"[《》「」『』（）()\[\]【】·\s]")
 # 两边都过这张表，数字写法差异就不再影响匹配。
 _DIGIT_TO_CN = str.maketrans("0123456789", "零一二三四五六七八九")
 
+# 拉丁字母按读音取拼音串（「三T」→ san+ti，命中「三体」）。
+# ASR 会把书名里的字写成发音相近的字母（实测「三体」→「3T」），
+# 拼音兜底必须先把字母「读出来」再比，否则 santi 对不上 sanT。
+_LETTER_PINYIN = {
+    "a": "ei", "b": "bi", "c": "xi", "d": "di", "e": "yi", "f": "aifu",
+    "g": "ji", "h": "aichi", "i": "ai", "j": "jie", "k": "kei", "l": "ailu",
+    "m": "aimu", "n": "en", "o": "ou", "p": "pi", "q": "qiu", "r": "ar",
+    "s": "aisi", "t": "ti", "u": "you", "v": "wei", "w": "dabuliu",
+    "x": "aikesi", "y": "wai", "z": "zei",
+}
+
+
+def _py_of(text: str) -> str:
+    """汉字→拼音；拉丁字母→其读音的拼音（只用于同音兜底比较）。
+
+    lazy_pinyin 会把字母原样保留（「三T」→ 'sanT'），与读音串
+    （「三体」→ 'santi'）对不上。「3T」是 ASR 实测变体，这里把
+    字母按读音展开后再比较。
+    """
+    if not _HAS_PINYIN:
+        return ""
+    out = []
+    buf = ""
+    for ch in text:
+        low = ch.lower()
+        if "a" <= low <= "z":
+            if buf:
+                out.append("".join(lazy_pinyin(buf)))
+                buf = ""
+            out.append(_LETTER_PINYIN.get(low, low))
+        else:
+            buf += ch
+    if buf:
+        out.append("".join(lazy_pinyin(buf)))
+    return "".join(out)
+
 
 def _normalize(text: str) -> str:
     """去掉书名号/括号等 ASR 不会读出的字符，阿拉伯数字转成汉字。"""
@@ -146,6 +182,11 @@ def _clean(raw: str) -> str:
     return text
 
 
+def _drop_er(text: str) -> str:
+    """去掉儿化「儿」——ASR 常把儿化音丢掉（「明朝那些事儿」→「明朝那些事」）。"""
+    return text.replace("儿", "")
+
+
 class AudiobookIntent:
     """匹配器。构造时传入书库真实书名，运行时只做纯文本判断。"""
 
@@ -168,6 +209,15 @@ class AudiobookIntent:
         # 核心名长的优先（「余罪」要先于更短的候选被判掉）
         self._core_pairs.sort(key=lambda p: len(p[1]), reverse=True)
 
+        # 去儿化兜底：ASR 常丢儿化音（「明朝那些事儿」→「明朝那些事」）。
+        # 只对含「儿」的书名构造去儿形态；比对仍要求完整词组，语义不变。
+        self._norm_pairs_er = [
+            (t, _drop_er(n)) for t, n in self._norm_pairs if "儿" in n
+        ]
+        self._core_pairs_er = [
+            (t, _drop_er(n)) for t, n in self._core_pairs if "儿" in n
+        ]
+
         # 拼音形式，供同音兜底：ASR 错字时字面对不上、读音对得上
         # （三体 ← 3题/三提/山体）。只收「完整书名」和「核心名」两种形态，
         # 与字面两级同一语义；至少两个音节才参战，单字书名太容易误伤。
@@ -181,8 +231,20 @@ class AudiobookIntent:
                     seen.add(form)
                     syl = lazy_pinyin(form)
                     if len(syl) >= 2:
-                        self._py_pairs.append((t, "".join(syl)))
+                        self._py_pairs.append((t, _py_of(form)))
             self._py_pairs.sort(key=lambda p: len(p[1]), reverse=True)
+
+        # 去儿形态的拼音（同音 + 丢儿化的组合场景）
+        self._py_pairs_er = []
+        if _HAS_PINYIN:
+            seen_er = set()
+            for t, n in self._norm_pairs_er + self._core_pairs_er:
+                if not n or n in seen_er:
+                    continue
+                seen_er.add(n)
+                if len(lazy_pinyin(n)) >= 2:
+                    self._py_pairs_er.append((t, _py_of(n)))
+            self._py_pairs_er.sort(key=lambda p: len(p[1]), reverse=True)
 
         # 「整句就是书名」用：一个字都不差（或拼音一字不差）才算。
         # 供「三体吧」这种没有播放动词、但整句就是书名的回话使用。
@@ -192,12 +254,17 @@ class AudiobookIntent:
             for form in (_normalize(t), _core_name(t)):
                 if form:
                     self._exact_map.setdefault(form, t)
+        # 去儿形态也认「整句即书名」（「明朝那些事吧」）
+        for form, t in list(self._exact_map.items()):
+            er = _drop_er(form)
+            if er and er != form:
+                self._exact_map.setdefault(er, t)
         self._exact_py = {}
         if _HAS_PINYIN:
             for form, t in self._exact_map.items():
                 syl = lazy_pinyin(form)
                 if len(syl) >= 2:
-                    self._exact_py.setdefault("".join(syl), t)
+                    self._exact_py.setdefault(_py_of(form), t)
 
     def _match_title(self, text: str):
         """在给定文本里找书名，返回原始书名或 None。
@@ -218,6 +285,13 @@ class AudiobookIntent:
         for t, n in self._core_pairs:
             if n and n in nt:
                 return t
+        # 去儿化兜底（书名含儿、ASR 丢儿）：query 原样匹配去儿书名
+        for t, n in self._norm_pairs_er:
+            if n and n in nt:
+                return t
+        for t, n in self._core_pairs_er:
+            if n and n in nt:
+                return t
         return None
 
     def _pinyin_match(self, text: str):
@@ -228,10 +302,13 @@ class AudiobookIntent:
         """
         if not _HAS_PINYIN or not self._py_pairs:
             return None
-        py = "".join(lazy_pinyin(_normalize(text)))
+        py = _py_of(_normalize(text))
         if not py:
             return None
         for t, tpy in self._py_pairs:
+            if tpy in py:
+                return t
+        for t, tpy in self._py_pairs_er:
             if tpy in py:
                 return t
         return None
@@ -251,7 +328,7 @@ class AudiobookIntent:
                 nc = _normalize(cleaned)
                 hit = self._exact_map.get(nc)
                 if not hit and _HAS_PINYIN and self._exact_py:
-                    hit = self._exact_py.get("".join(lazy_pinyin(nc)))
+                    hit = self._exact_py.get(_py_of(nc))
                 if hit:
                     mode = (
                         "new"
@@ -265,9 +342,14 @@ class AudiobookIntent:
 
         # 1) 清洗后的片段做精确/前缀匹配（最严格，误判风险最低）
         if cleaned:
+            nc = _normalize(cleaned)
+            nc_er = _drop_er(nc)
             for t in self.titles:
-                nc = _normalize(cleaned)
-                if nc == _normalize(t) or nc.startswith(_normalize(t)):
+                nt_t = _normalize(t)
+                if nc == nt_t or nc.startswith(nt_t):
+                    return t, mode
+                nt_t_er = _drop_er(nt_t)
+                if nt_t_er and (nc_er == nt_t_er or nc_er.startswith(nt_t_er)):
                     return t, mode
 
         # 2) 清洗后的片段里宽松搜书名
@@ -288,6 +370,17 @@ class AudiobookIntent:
             hit = self._pinyin_match(probe)
             if hit:
                 return hit, mode
+
+        # 5) 泛指回退：有播放动词、但没有任何书名线索（「播放有声书」
+        #    「我想听书」「继续听书」）→ 哨兵，交上层续播「最近在听」
+        #    的那本（插件侧自记状态；无记录时回引导话术）。
+        #    有残留片段的（「播放杀体」这类没兜住的错字）不走这里——
+        #    保持交回 LLM 并留日志，等错法档案回填。
+        _probe = cleaned
+        for _w in ("有声书", "音频书", "音频", "小说", "书"):
+            _probe = _probe.replace(_w, "")
+        if not _probe.strip():
+            return "__recent__", mode
 
         # 播放意图明确但书名没匹上——大概率 ASR 又写错字了。
         # 记一条，方便按真实变体回填 _HOMOPHONE_FIX。
