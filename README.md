@@ -10,7 +10,7 @@
 
 ![](./docs/images/cover.jpg)
 
-**🔗 快速跳转**：[实现的功能与案例](#实现的功能与案例) · [完整链路](#完整链路nas-媒体库--hermes--小爱音箱) · [快速开始](#快速开始)
+**🔗 快速跳转**：[实现的功能与案例](#实现的功能与案例) · [AI 快捷接入](#ai-快捷接入) · [完整链路](#完整链路nas-媒体库--hermes--小爱音箱) · [快速开始](#快速开始)
 
 ## 简介
 
@@ -244,6 +244,32 @@ connection.py（打了补丁）── 调大模型**之前**先做确定性意�
 👉 [小爱音箱接入 MiGPT 演示视频](https://www.bilibili.com/video/BV1N1421y7qn)
 
 [![](./docs/images/migpt.jpg)](https://www.bilibili.com/video/BV1N1421y7qn)
+
+## AI 快捷接入
+
+不必自己啃文档——把下面这段话发给你的 AI 编程助手（Claude Code、Codex、Cursor、Hermes 等），
+它会读本仓库的部署文档，带你从刷机、搭服务端，一路装到对着音箱点歌：
+
+```text
+根据 https://github.com/HunterXing/open-xiaoai
+帮我实现小爱音箱 Pro 接入大模型，并具备接入有声书、音乐等功能
+```
+
+只想要其中一部分能力？把需求收窄即可：
+
+```text
+# 只要大模型：对话 / 记忆 / 智能家居
+根据 https://github.com/HunterXing/open-xiaoai
+帮我实现小爱音箱 Pro 接入 Hermes Agent，支持长期记忆、联网搜索和智能家居控制
+
+# 只要媒体库：有声书 / 音乐
+根据 https://github.com/HunterXing/open-xiaoai
+帮我实现小爱音箱 Pro 播放自建书库（BookOrbit）的有声书和音乐库（Navidrome）的歌曲
+```
+
+> [!TIP]
+> 跟 AI 交代清楚你的环境（服务器系统、媒体库软件、音箱型号），它会照你的环境微调步骤；
+> 刷机、填凭据这类必须动手的环节，它会一步步引导你。
 
 ## 快速开始
 
