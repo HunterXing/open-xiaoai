@@ -6,7 +6,7 @@ import time
 
 from config import APP_CONFIG
 from xiaozhi.event import EventManager
-from xiaozhi.ref import set_xiaozhi
+from xiaozhi.ref import get_speaker, set_xiaozhi
 from xiaozhi.services.audio.kws import KWS
 from xiaozhi.services.audio.vad import VAD
 from xiaozhi.services.native_tts import (
@@ -233,6 +233,32 @@ class XiaoZhi:
         print(f"🌐 网络连接异常，将自动重试：{message}")
         self.set_device_state(DeviceState.IDLE)
 
+    def _schedule_native_pause(self):
+        """[本地补丁 2026-10-15] 防双播：暂停原生媒体的两脚（立即 + 1.5s 后）。
+
+        只在「服务端音频首帧到达」（= 我们真的开始出声）时触发：
+        mphelper pause 只停原生媒体播放，不碰 TTS 通道（我们的音频走的
+        是 TTS 通道，不受影响）。
+        """
+        async def _job():
+            for delay in (0.0, 1.5):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    sp = get_speaker()
+                    if sp is None:
+                        print("⚠️ [防双播] speaker 未就绪，跳过暂停")
+                        return
+                    ok = await sp.set_playing(False)
+                    print(f"⏸️ [防双播] 暂停原生媒体(@首帧): {'成功' if ok else '未生效'}")
+                except Exception as error:
+                    print(f"⚠️ [防双播] 暂停原生媒体出错: {error}")
+
+        try:
+            asyncio.run_coroutine_threadsafe(_job(), self.loop)
+        except Exception as error:
+            print(f"⚠️ [防双播] 无法调度暂停: {error}")
+
     def _on_incoming_audio(self, data):
         """接收音频数据回调"""
         # [本地补丁 2026-10-14] 原版在 native_xiaomi 模式下直接 return，
@@ -253,6 +279,19 @@ class XiaoZhi:
                     f"⚠️ [有声书] 服务端音频帧被丢弃（device_state={self.device_state}）"
                 )
             return
+        # [本地补丁 2026-10-15] 防双播（首帧触发版）：我们真的要出声了
+        # ——给原生媒体补一脚暂停（原生 NLU 可能在处理同一句「播放X」，
+        # 拉起它自己的音乐 App）。判据「距上一帧 >3 秒」= 新播放的首帧，
+        # 播放中帧间隔 60ms 不会重复触发。
+        # 之前版本在「收到指令」事件就暂停，对话流偶尔接不到那句指令时
+        # 会「原生被停了、我们也没播」→ 改为以首帧为准。
+        _guard_now = time.time()
+        _guard_last = getattr(self, "_ab_guard_last_frame", 0.0)
+        self._ab_guard_last_frame = _guard_now
+        if _guard_now - _guard_last > 3.0:
+            # 距上一帧超过 3 秒 = 这是一次新播放的第一帧（播放中帧间隔 60ms）
+            self._schedule_native_pause()
+
         if not getattr(self, "_ab_frame_logged", False):
             self._ab_frame_logged = True
             stream = getattr(self.audio_codec, "output_stream", None)

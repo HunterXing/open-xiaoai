@@ -100,8 +100,10 @@ async def play_music_library(conn: "ConnectionHandler", songs=None, kind="song",
 
     _sweep_stale()
 
-    # 先播报、再下载：下载要几百毫秒到几秒，播报正好盖住这段空档
-    _say(conn, _announce_text(kind, songs, label))
+    # 提示语。默认开；设 MUSIC_ANNOUNCE=0 静默起播——延迟已亚秒级，
+    # 播报会和歌声开头重叠（与有声书同一处理）。
+    if os.environ.get("MUSIC_ANNOUNCE", "1") != "0":
+        _say(conn, _announce_text(kind, songs, label))
 
     played = 0
     for song in songs:

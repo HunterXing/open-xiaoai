@@ -1,7 +1,14 @@
+import os
+
 import numpy as np
 import sherpa_onnx
 
 from xiaozhi.utils.file import get_model_file_path
+
+# 唤醒灵敏度：越大越难触发（更抗误唤醒），越小越灵敏。
+# 默认 0.2；调低会提高远距离/轻声唤醒成功率，代价是抗噪能力下降。
+# 用环境变量覆盖，避免每次调参都要重建镜像。
+KEYWORDS_THRESHOLD = float(os.environ.get("KWS_KEYWORDS_THRESHOLD", "0.15"))
 
 
 class _SherpaOnnx:
@@ -11,7 +18,7 @@ class _SherpaOnnx:
             num_threads=1,
             max_active_paths=8,
             keywords_score=2.0,
-            keywords_threshold=0.2,
+            keywords_threshold=KEYWORDS_THRESHOLD,
             num_trailing_blanks=0,
             keywords_file=get_model_file_path("keywords.txt"),
             tokens=get_model_file_path("tokens.txt"),

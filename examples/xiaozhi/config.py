@@ -10,10 +10,20 @@ async def before_wakeup(speaker, text, source):
         - 'xiaoai': 小爱同学收到用户指令
     """
     if source == "kws":
+        # [本地补丁 2026-10-15] 亮起「被唤醒」呼吸灯——与原生「小爱同学」一致
+        # 的视觉反馈（播放长音频时听觉提示容易被盖住，灯更直观）。
+        try:
+            await speaker.wake_up(awake=True, silent=False)
+        except Exception:
+            pass
         # 播放唤醒提示语
         await speaker.play(text="你好主人，请问有什么吩咐？")
         # 返回 True 唤醒小智 AI
         return True
+
+    # [本地补丁 2026-10-15] 防双播已迁移：不在「收到指令」时暂停原生
+    # （对话流偶尔接不到指令时会把原生误停→两边都没声），改为在
+    # 「服务端音频首帧到达」时触发（xiaozhi.py::_schedule_native_pause）。
 
     if source == "xiaoai" and text == "召唤小智":
         # 打断原来的小爱同学
