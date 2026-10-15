@@ -202,8 +202,11 @@ INJECT_A = '''            # BookOrbit 有声书意图预判：命中就自己造
             _hit_tool_call = None
             if _ab_hit is not None and functions:
                 _ab_title, _ab_mode = _ab_hit
+                _ab_label = (
+                    "最近在听" if _ab_title == "__recent__" else f"《{_ab_title}》"
+                )
                 self.logger.bind(tag=TAG).info(
-                    f"有声书意图预判命中：《{_ab_title}》mode={_ab_mode}（跳过 LLM）"
+                    f"有声书意图预判命中：{_ab_label} mode={_ab_mode}（跳过 LLM）"
                 )
                 _ab_args = json.dumps(
                     {"title": _ab_title, "mode": _ab_mode}, ensure_ascii=False

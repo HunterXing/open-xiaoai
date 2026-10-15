@@ -10,7 +10,9 @@
 
 import os
 import asyncio
+import json
 import subprocess
+import time
 
 from core.providers.tts.dto.dto import TTSMessageDTO, SentenceType, ContentType
 from plugins_func.register import register_function, ToolType, ActionResponse, Action
@@ -72,8 +74,23 @@ bookorbit_function_desc = {
 
 @register_function("play_audiobook", bookorbit_function_desc, ToolType.SYSTEM_CTL)
 async def play_audiobook(conn: "ConnectionHandler", title: str, mode: str = "resume"):
+    if title == "__recent__":
+        # 「播放有声书」这类不带书名的泛指：续播「最近在听」的那本。
+        # 哨兵由 bookorbit_intent 在无书名线索时给出；状态是插件自记的
+        # （平台进度表不写回，不能拿它当最近——会拿到别的书）。
+        recent = _load_recent_book()
+        if not recent:
+            return ActionResponse(
+                action=Action.RESPONSE,
+                result="no recent",
+                response="想听哪本有声书？告诉我书名，比如「播放三体」",
+            )
+        title = recent
     try:
-        target = _resolve(title, mode)
+        # _resolve 里是 PG 查询 + NAS 文件 stat，都是阻塞 IO。直接调用会卡住
+        # 整个事件循环（实测书库扫库时卡 39s，websocket 心跳被拖到断开重连），
+        # 必须丢线程池——慢也只会慢这一个请求，不再拖垮全局。
+        target = await asyncio.to_thread(_resolve, title, mode)
     except Exception as e:
         conn.logger.bind(tag=TAG).error(f"有声书解析失败: {e}")
         return ActionResponse(
@@ -92,7 +109,7 @@ async def play_audiobook(conn: "ConnectionHandler", title: str, mode: str = "res
         f"有声书命中: 《{book_title}》{file_title} 起播={start_seconds}s path={abs_path}"
     )
 
-    # 提示语。默认开；排查首响延迟时可设 BOOKORBIT_ANNOUNCE=0 静默起播。
+    # 提示语。默认开；设 BOOKORBIT_ANNOUNCE=0 静默起播（延迟已亚秒级，播报会和书声开头重叠）。
     if os.environ.get("BOOKORBIT_ANNOUNCE", "1") != "0":
         _say(conn, _announce_text(book_title, file_title))
 
@@ -104,6 +121,8 @@ async def play_audiobook(conn: "ConnectionHandler", title: str, mode: str = "res
     else:
         _enqueue_file(conn, abs_path)
 
+    # 播成功才更新「最近在听」（enqueue 抛异常时走不到这里）。
+    _remember_recent(conn, book_title)
     return ActionResponse(action=Action.RECORD, result=abs_path, response="")
 
 
@@ -112,6 +131,43 @@ async def play_audiobook(conn: "ConnectionHandler", title: str, mode: str = "res
 # (aplay) 是两条独立通路，开头必然叠在一起。让提示语内部不带标点、末尾只留一个
 # 句号，服务端收到文本时就整段切出，而音频还要等解码（十几秒）才起，天然错开。
 _ANNOUNCE_SPLIT_PUNCT = "，~、,？?！!；;：:"
+
+
+# 「最近在听」自记状态：data/ 是宿主挂载目录，持久、可手查可清。
+# 「播放有声书」这类不带书名的泛指就续播这里记的最后一本。
+_RECENT_PATH = os.path.join(
+    os.environ.get("XIAOZHI_DATA_DIR", "/opt/xiaozhi-esp32-server/data"),
+    "xiaoai_recent_audiobook.json",
+)
+
+
+def _load_recent_book():
+    try:
+        with open(_RECENT_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            t = data.get("book_title")
+            return t if isinstance(t, str) and t.strip() else None
+    except Exception:
+        pass
+    return None
+
+
+def _remember_recent(conn, book_title):
+    """播成功就记一笔；写失败只留日志，不影响播放。"""
+    try:
+        os.makedirs(os.path.dirname(_RECENT_PATH), exist_ok=True)
+        with open(_RECENT_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "book_title": book_title,
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                },
+                f,
+                ensure_ascii=False,
+            )
+    except Exception as e:
+        conn.logger.bind(tag=TAG).warning(f"记录最近在听失败: {e}")
 
 
 def _announce_text(book_title, file_title):
