@@ -19,9 +19,32 @@ tool_call，绕开 LLM。
 2. **不吞对话**：命中后仍把书名/模式作为 tool_call 参数，插件自己回话。
 3. 书名从书库真实清单里匹配（构造期注入），不在清单里的一律不拦，
    交给 LLM 用嘴回答「书库里没有」。
+4. **容 ASR 的错**：ASR 会把书名写成同音字或阿拉伯数字（实测「三体」
+   →「3天」「3题」）。匹配分四层，字面（完整名/核心名）优先，
+   拼音兜底；都不过就原样放给 LLM，不硬猜。
 """
 
+import logging
+import os
 import re
+import sys
+
+logger = logging.getLogger(__name__)
+
+# 可选依赖：pypinyin —— 同音兜底。
+# 表驱动修字只能覆盖已知变体，拼音比对能兜住没见过的新变体。
+# 依赖装在插件同目录的 _vendor（docker-compose 里挂进来），容器重建不丢；
+# 装不上也不影响主链：_HAS_PINYIN=False 时退回纯表匹配。
+_VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_vendor")
+if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
+    sys.path.insert(0, _VENDOR)
+try:
+    from pypinyin import lazy_pinyin
+
+    _HAS_PINYIN = True
+except Exception:  # 没有依赖只是少一层容错，不影响主链
+    lazy_pinyin = None
+    _HAS_PINYIN = False
 
 # 播放意图的触发词。任一命中即进入书名解析。
 _PLAY_PATTERNS = [
@@ -51,10 +74,13 @@ _NEW_PATTERNS = [
     )
 ]
 
-# ASR 常见同音/近音错字 → 正确写法。实测「播放3天」被 ASR 听成三体。
+# ASR 常见同音/近音错字 → 正确写法。实测「三体」被听成过「3天」（首夜）
+# 和「3题」（10-15 早上）。带阿拉伯数字的写法在这里也要留全——_clean
+# 是逐字替换，发生在 _normalize 之前，不走数字转汉字那张表。
 _HOMOPHONE_FIX = {
     "3天": "三体", "三天": "三体", "仨体": "三体", "3提": "三体",
     "三提": "三体", "山体": "三体", "散体": "三体", "3体": "三体",
+    "3题": "三体", "三题": "三体", "叁体": "三体",
 }
 
 # 书名里的噪声：ASR 常见错字/口头语。「3天」是实测到的「三体」误识。
@@ -68,10 +94,14 @@ _NOISE = [
 # 匹配时两边都归一化，所以「播放剑来上」能对上书名「《剑来》上」。
 _IGNORED_CHARS = re.compile(r"[《》「」『』（）()\[\]【】·\s]")
 
+# ASR 输出数字时给阿拉伯数字（「3体」），库里书名是汉字（「三体」）。
+# 两边都过这张表，数字写法差异就不再影响匹配。
+_DIGIT_TO_CN = str.maketrans("0123456789", "零一二三四五六七八九")
+
 
 def _normalize(text: str) -> str:
-    """去掉书名号/括号等 ASR 不会读出的字符，用于书名比较。"""
-    return _IGNORED_CHARS.sub("", text)
+    """去掉书名号/括号等 ASR 不会读出的字符，阿拉伯数字转成汉字。"""
+    return _IGNORED_CHARS.sub("", text).translate(_DIGIT_TO_CN)
 
 
 # 核心名的切分点：原书名里的括号/书名号/竖线/冒号。
@@ -106,6 +136,9 @@ def _clean(raw: str) -> str:
         text = text.replace(n, " ")
     # 剩下的标点/空白
     text = re.sub(r"[，。！？、,.!?~]", " ", text).strip()
+    # 句尾语气词：「三体吧」「听三体啊」——大模型刚问过「想听哪本」，
+    # 用户答书名时几乎一定带个语气词。
+    text = re.sub(r"[吧啊呀呢哦嘛哇啦]+$", "", text).strip()
     return text
 
 
@@ -131,6 +164,37 @@ class AudiobookIntent:
         # 核心名长的优先（「余罪」要先于更短的候选被判掉）
         self._core_pairs.sort(key=lambda p: len(p[1]), reverse=True)
 
+        # 拼音形式，供同音兜底：ASR 错字时字面对不上、读音对得上
+        # （三体 ← 3题/三提/山体）。只收「完整书名」和「核心名」两种形态，
+        # 与字面两级同一语义；至少两个音节才参战，单字书名太容易误伤。
+        self._py_pairs = []
+        if _HAS_PINYIN:
+            seen = set()
+            for t in self.titles:
+                for form in (_normalize(t), _core_name(t)):
+                    if not form or form in seen:
+                        continue
+                    seen.add(form)
+                    syl = lazy_pinyin(form)
+                    if len(syl) >= 2:
+                        self._py_pairs.append((t, "".join(syl)))
+            self._py_pairs.sort(key=lambda p: len(p[1]), reverse=True)
+
+        # 「整句就是书名」用：一个字都不差（或拼音一字不差）才算。
+        # 供「三体吧」这种没有播放动词、但整句就是书名的回话使用。
+        # setdefault + titles 已按长名优先，所以核心名相同时归长书名。
+        self._exact_map = {}
+        for t in self.titles:
+            for form in (_normalize(t), _core_name(t)):
+                if form:
+                    self._exact_map.setdefault(form, t)
+        self._exact_py = {}
+        if _HAS_PINYIN:
+            for form, t in self._exact_map.items():
+                syl = lazy_pinyin(form)
+                if len(syl) >= 2:
+                    self._exact_py.setdefault("".join(syl), t)
+
     def _match_title(self, text: str):
         """在给定文本里找书名，返回原始书名或 None。
 
@@ -152,17 +216,50 @@ class AudiobookIntent:
                 return t
         return None
 
+    def _pinyin_match(self, text: str):
+        """同音兜底：字面对不上但读音一致时命中（三体 ← 3题/三提/山体）。
+
+        与字面匹配同语义：书名/核心名的完整拼音串是候选文本拼音串的
+        子串才算命中，不做截断。pypinyin 缺席时直接返回 None。
+        """
+        if not _HAS_PINYIN or not self._py_pairs:
+            return None
+        py = "".join(lazy_pinyin(_normalize(text)))
+        if not py:
+            return None
+        for t, tpy in self._py_pairs:
+            if tpy in py:
+                return t
+        return None
+
     def match(self, text: str):
         """返回 (title, mode) 或 None。mode ∈ {"resume", "new"}。"""
         if not text or not self.titles:
             return None
+
+        cleaned = _clean(text)
+
         if not any(p.search(text) for p in _PLAY_PATTERNS):
+            # 没有播放动词时，只有「整句就是书名」才认（「三体吧」「三题吧」）
+            # ——大模型问过「想听哪本」后，用户答书名是自然回话。
+            # 「三体讲了什么」这种整句对不上书名，仍然放给 LLM。
+            if cleaned:
+                nc = _normalize(cleaned)
+                hit = self._exact_map.get(nc)
+                if not hit and _HAS_PINYIN and self._exact_py:
+                    hit = self._exact_py.get("".join(lazy_pinyin(nc)))
+                if hit:
+                    mode = (
+                        "new"
+                        if any(p.search(text) for p in _NEW_PATTERNS)
+                        else "resume"
+                    )
+                    return hit, mode
             return None
 
         mode = "new" if any(p.search(text) for p in _NEW_PATTERNS) else "resume"
 
         # 1) 清洗后的片段做精确/前缀匹配（最严格，误判风险最低）
-        cleaned = _clean(text)
         if cleaned:
             for t in self.titles:
                 nc = _normalize(cleaned)
@@ -180,4 +277,18 @@ class AudiobookIntent:
         if hit:
             return hit, mode
 
+        # 4) 同音兜底：字面全错但读音对得上（ASR 把「三体」写成「3题」）
+        for probe in (cleaned, text):
+            if not probe:
+                continue
+            hit = self._pinyin_match(probe)
+            if hit:
+                return hit, mode
+
+        # 播放意图明确但书名没匹上——大概率 ASR 又写错字了。
+        # 记一条，方便按真实变体回填 _HOMOPHONE_FIX。
+        # （音乐请求也会走到这里，属正常：它们归音乐匹配器管。）
+        logger.info(
+            "[audiobook] 播放意图未匹配到有声书名: text=%r cleaned=%r", text, cleaned
+        )
         return None
